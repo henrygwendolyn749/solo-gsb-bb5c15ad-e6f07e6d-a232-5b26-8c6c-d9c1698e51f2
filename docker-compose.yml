@@ -1,0 +1,14 @@
+services:
+  timing-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      STATION_COUNT: "6"          # 赛道站点总数
+      DB_PATH: /data/timing.db    # SQLite 文件位置
+    volumes:
+      - timing-data:/data         # 持久化数据；删除卷可重置并重新播种
+    restart: unless-stopped
+
+volumes:
+  timing-data:
