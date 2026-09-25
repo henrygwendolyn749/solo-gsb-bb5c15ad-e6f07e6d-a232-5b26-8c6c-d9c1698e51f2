@@ -1,12 +1,14 @@
-"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算 / 更正预演。"""
+"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算 / 更正预演 / 成绩发布。"""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
+from . import db
 from .models import (
     BatchCheckinCreate,
     BatchCheckinOut,
@@ -16,6 +18,7 @@ from .models import (
     CheckinOut,
     CorrectionPreview,
     PreviewCorrectionOut,
+    PublicationOut,
     RunnerPreview,
     RunnerSummary,
     Segment,
@@ -428,3 +431,82 @@ def preview_correction(
         corrects=payload.corrects,
         affected_runners=affected,
     )
+
+
+# ---------- 成绩发布 ----------
+
+
+def publish_results(conn: sqlite3.Connection) -> PublicationOut:
+    """发布当前实时成绩的整版快照，生成单调递增的新版本。
+
+    在 BEGIN IMMEDIATE 事务内"先取写锁、再读全部打卡"：持锁期间任何
+    并发的打卡 / 更正 / 撤销都被阻塞（见 db.immediate_transaction），
+    因此读到的全部选手分段结果来自同一个提交时点，同一版本不会混入
+    不同时间点的数据。版本头与全体选手快照在同一事务内原子保存；
+    后续打卡、更正或撤销只作用于 checkins 实时表，不影响已发布版本。
+    """
+    published_at = _now()
+    with db.immediate_transaction(conn):
+        rows = conn.execute(
+            "SELECT DISTINCT runner_id FROM checkins ORDER BY runner_id"
+        ).fetchall()
+        results = [_compute_splits(conn, row["runner_id"]) for row in rows]
+
+        count = station_count()
+        cursor = conn.execute(
+            "INSERT INTO publications (published_at, station_count, runner_count)"
+            " VALUES (?, ?, ?)",
+            (published_at.isoformat(), count, len(results)),
+        )
+        version = cursor.lastrowid
+        conn.executemany(
+            "INSERT INTO publication_entries (version, runner_id, position, data)"
+            " VALUES (?, ?, ?, ?)",
+            [
+                (version, splits.runner_id, i, splits.model_dump_json())
+                for i, splits in enumerate(results)
+            ],
+        )
+
+    return PublicationOut(
+        version=version,
+        published_at=published_at,
+        station_count=count,
+        results=results,
+    )
+
+
+def _load_publication(conn: sqlite3.Connection, version: int) -> PublicationOut | None:
+    header = conn.execute(
+        "SELECT * FROM publications WHERE version = ?", (version,)
+    ).fetchone()
+    if header is None:
+        return None
+    rows = conn.execute(
+        "SELECT data FROM publication_entries WHERE version = ? ORDER BY position",
+        (version,),
+    ).fetchall()
+    return PublicationOut(
+        version=header["version"],
+        published_at=datetime.fromisoformat(header["published_at"]),
+        station_count=header["station_count"],
+        results=[SplitsOut.model_validate(json.loads(r["data"])) for r in rows],
+    )
+
+
+def get_publication(conn: sqlite3.Connection, version: int) -> PublicationOut:
+    """按版本号返回该版本的完整成绩；不存在时 404。"""
+    pub = _load_publication(conn, version)
+    if pub is None:
+        raise HTTPException(status_code=404, detail=f"成绩版本 {version} 不存在")
+    return pub
+
+
+def get_latest_publication(conn: sqlite3.Connection) -> PublicationOut:
+    """返回最新版本完整成绩；尚未发布过任何版本时 404。"""
+    header = conn.execute(
+        "SELECT MAX(version) AS version FROM publications"
+    ).fetchone()
+    if header is None or header["version"] is None:
+        raise HTTPException(status_code=404, detail="尚未发布任何成绩版本")
+    return get_publication(conn, header["version"])

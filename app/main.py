@@ -15,6 +15,7 @@ from .models import (
     CheckinOut,
     CorrectionPreview,
     PreviewCorrectionOut,
+    PublicationOut,
     SplitsOut,
 )
 
@@ -33,11 +34,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
         "任一失败整体回滚），并可预演更正（整体回滚）；"
-        "按站点顺序重算相邻站分段用时，缺站或时间倒退的分段标记为待定。"
+        "按站点顺序重算相邻站分段用时，缺站或时间倒退的分段标记为待定；"
+        "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询。"
     ),
     lifespan=lifespan,
 )
@@ -138,3 +140,37 @@ def get_splits(
     runner_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> SplitsOut:
     return service.get_splits(conn, runner_id)
+
+
+@app.post(
+    "/api/publications",
+    response_model=PublicationOut,
+    status_code=201,
+    summary="发布成绩版本（同一事务读取当前打卡、整版原子保存）",
+)
+def post_publication(
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PublicationOut:
+    return service.publish_results(conn)
+
+
+@app.get(
+    "/api/publications/latest",
+    response_model=PublicationOut,
+    summary="查询最新发布版本完整成绩",
+)
+def get_publication_latest(
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PublicationOut:
+    return service.get_latest_publication(conn)
+
+
+@app.get(
+    "/api/publications/{version}",
+    response_model=PublicationOut,
+    summary="按版本号查询完整成绩",
+)
+def get_publication(
+    version: int, conn: sqlite3.Connection = Depends(get_db)
+) -> PublicationOut:
+    return service.get_publication(conn, version)

@@ -132,3 +132,16 @@ class PreviewCorrectionOut(BaseModel):
     affected_runners: list[RunnerPreview] = Field(
         ..., description="受影响选手；更正跨选手时包含原选手与新选手"
     )
+
+
+class PublicationOut(BaseModel):
+    """一个已发布版本的完整成绩快照。"""
+
+    version: int = Field(..., description="发布版本号，从 1 单调递增")
+    published_at: datetime = Field(..., description="发布时间")
+    station_count: int = Field(..., description="发布时的赛道站点总数")
+    results: list[SplitsOut] = Field(
+        ...,
+        description="该版本全体有打卡记录选手的完整分段结果（按选手号排序）；"
+        "未完赛选手同样保留 pending 分段",
+    )
