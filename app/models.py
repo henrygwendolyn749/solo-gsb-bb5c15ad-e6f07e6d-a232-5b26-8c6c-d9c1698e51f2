@@ -132,3 +132,24 @@ class PreviewCorrectionOut(BaseModel):
     affected_runners: list[RunnerPreview] = Field(
         ..., description="受影响选手；更正跨选手时包含原选手与新选手"
     )
+
+
+class PublicationRunner(RunnerSummary):
+    """某发布版本内一位选手的完整分段结果（快照，含 pending 分段）。"""
+
+    runner_id: str
+    stations: list[StationTime] = Field(..., description="发布时各站点采用的有效打卡（同站取最早）")
+    segments: list[Segment] = Field(..., description="发布时的相邻站分段（缺站 / 时间倒退为 pending）")
+
+
+class PublicationOut(BaseModel):
+    """成绩发布版本：整版快照，发布后不再随实时打卡 / 更正 / 撤销变化。"""
+
+    version: int = Field(..., description="递增版本号，从 1 开始")
+    created_at: datetime = Field(..., description="发布时间（UTC）")
+    runner_count: int = Field(..., description="本版选手数（含未完赛）")
+    complete_count: int = Field(..., description="本版完赛选手数")
+    station_count: int = Field(..., description="发布时的赛道站点总数")
+    runners: list[PublicationRunner] = Field(
+        ..., description="全部有打卡记录的选手（含未完赛），按选手号排序"
+    )

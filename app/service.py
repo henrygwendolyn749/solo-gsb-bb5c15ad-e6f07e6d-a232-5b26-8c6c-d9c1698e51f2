@@ -1,6 +1,7 @@
-"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算 / 更正预演。"""
+"""核心业务逻辑：打卡写入 / 更正 / 撤销 / 分段重算 / 更正预演 / 成绩发布。"""
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from .models import (
     CheckinOut,
     CorrectionPreview,
     PreviewCorrectionOut,
+    PublicationOut,
+    PublicationRunner,
     RunnerPreview,
     RunnerSummary,
     Segment,
@@ -427,4 +430,133 @@ def preview_correction(
         occurred_at=occurred,
         corrects=payload.corrects,
         affected_runners=affected,
+    )
+
+
+# ---------- 成绩发布 ----------
+
+
+def publish_results(conn: sqlite3.Connection) -> PublicationOut:
+    """发布当前实时成绩为一个新版本（整版快照）。
+
+    - 在同一 SQLite 事务中读取当前全部打卡，按现有分段规则为**所有有打卡记录
+      （含仅有已撤销记录）**的选手重算结果，未完赛选手同样保留 pending 分段；
+    - 以 BEGIN IMMEDIATE 立即取得库级写锁：事务期间其他打卡 / 更正 / 撤销
+      只能排队等待，因此本版读到的数据来自同一提交点，不会混入不同时间点的数据；
+    - 版本号由 publications.version 自增生成，与选手快照在同一事务内原子落盘；
+    - 发布后再发生的打卡、更正或撤销只影响实时成绩，已发布版本保持不变。
+    """
+    created = _now()
+    # 该连接在本请求内独占；切换为手动事务以使用 BEGIN IMMEDIATE
+    prev_isolation = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT runner_id FROM checkins ORDER BY runner_id"
+            ).fetchall()
+            runners = [_compute_splits(conn, r["runner_id"]) for r in rows]
+
+            cursor = conn.execute(
+                "INSERT INTO publications (created_at, runner_count, complete_count)"
+                " VALUES (?, ?, ?)",
+                (
+                    created.isoformat(),
+                    len(runners),
+                    sum(1 for s in runners if s.complete),
+                ),
+            )
+            version = cursor.lastrowid
+            conn.executemany(
+                "INSERT INTO publication_runners"
+                " (version, runner_id, complete, splits_json) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        version,
+                        s.runner_id,
+                        1 if s.complete else 0,
+                        json.dumps(s.model_dump(mode="json"), ensure_ascii=False),
+                    )
+                    for s in runners
+                ],
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            # 仅当事务已成功开启时回滚，避免掩盖 BEGIN 阶段的异常
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.isolation_level = prev_isolation
+
+    return PublicationOut(
+        version=version,
+        created_at=created,
+        runner_count=len(runners),
+        complete_count=sum(1 for s in runners if s.complete),
+        station_count=station_count(),
+        runners=[_to_publication_runner(s) for s in runners],
+    )
+
+
+def get_publication(conn: sqlite3.Connection, version: int) -> PublicationOut:
+    """返回指定版本的完整成绩；版本不存在返回 404。"""
+    return _load_publication(
+        conn,
+        "WHERE p.version = ?",
+        (version,),
+        not_found=f"成绩版本 {version} 不存在",
+    )
+
+
+def get_latest_publication(conn: sqlite3.Connection) -> PublicationOut:
+    """返回最新发布版本的完整成绩；尚未发布任何版本时返回 404。"""
+    return _load_publication(
+        conn,
+        "ORDER BY p.version DESC LIMIT 1",
+        (),
+        not_found="尚未发布任何成绩版本",
+    )
+
+
+def _load_publication(
+    conn: sqlite3.Connection, where_or_limit: str, params: tuple, not_found: str
+) -> PublicationOut:
+    """按给定条件取发布头并载入该版全部选手快照。"""
+    pub = conn.execute(
+        f"SELECT * FROM publications p {where_or_limit}", params
+    ).fetchone()
+    if pub is None:
+        raise HTTPException(status_code=404, detail=not_found)
+    runner_rows = conn.execute(
+        "SELECT splits_json FROM publication_runners WHERE version = ?"
+        " ORDER BY runner_id",
+        (pub["version"],),
+    ).fetchall()
+    runners = [
+        PublicationRunner.model_validate(json.loads(r["splits_json"]))
+        for r in runner_rows
+    ]
+    # 站点数以快照内容为准，快照为空（无选手）时回退到当前配置
+    station_count_value = station_count()
+    if runners:
+        station_count_value = json.loads(runner_rows[0]["splits_json"])["station_count"]
+    return PublicationOut(
+        version=pub["version"],
+        created_at=datetime.fromisoformat(pub["created_at"]),
+        runner_count=pub["runner_count"],
+        complete_count=pub["complete_count"],
+        station_count=station_count_value,
+        runners=runners,
+    )
+
+
+def _to_publication_runner(splits: SplitsOut) -> PublicationRunner:
+    return PublicationRunner(
+        runner_id=splits.runner_id,
+        complete=splits.complete,
+        total_seconds=splits.total_seconds,
+        total=splits.total,
+        stations=splits.stations,
+        segments=splits.segments,
     )

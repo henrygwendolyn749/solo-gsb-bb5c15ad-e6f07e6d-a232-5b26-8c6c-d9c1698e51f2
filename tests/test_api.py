@@ -1,9 +1,13 @@
 """接口与分段逻辑测试。每个用例使用独立的临时数据库。"""
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db as db_module
+from app import seed, service
 from app.main import app
 
 
@@ -517,3 +521,233 @@ def test_batch_incomplete_runner_result(client):
     assert r.json()["affected_runners"] == [
         {"runner_id": "TB11", "complete": False, "total_seconds": None, "total": None}
     ]
+
+
+# ---------- 成绩发布 ----------
+
+
+def publish(client):
+    return client.post("/api/publications")
+
+
+def test_latest_and_by_version_404_before_any_publication(client):
+    assert client.get("/api/publications/latest").status_code == 404
+    assert client.get("/api/publications/1").status_code == 404
+    assert client.get("/api/publications/999").status_code == 404
+
+
+def test_publish_snapshots_all_runners_including_incomplete(client):
+    r = publish(client)
+    assert r.status_code == 201
+    data = r.json()
+    assert data["version"] == 1
+    # 种子数据有 6 名选手：R001、R002、R004 完赛；
+    # R003 缺站、R005 撤销、R006 时间倒退，均未完赛
+    assert data["runner_count"] == 6
+    assert data["complete_count"] == 3
+    assert data["station_count"] == 6
+    runners = {x["runner_id"]: x for x in data["runners"]}
+    assert [x["runner_id"] for x in data["runners"]] == [f"R00{i}" for i in range(1, 7)]
+
+    # 完赛选手快照完整
+    r1 = runners["R001"]
+    assert r1["complete"] is True
+    assert r1["total_seconds"] == 3 * 3600 + 30 * 60
+    assert r1["total"] == "3:30:00"
+
+    # 未完赛选手同样保留：状态、空总用时与 pending 分段全部固化
+    r3 = runners["R003"]
+    assert r3["complete"] is False
+    assert r3["total_seconds"] is None and r3["total"] is None
+    pending = {(s["from_station"], s["to_station"])
+               for s in r3["segments"] if s["status"] == "pending"}
+    assert pending == {(3, 4), (4, 5)}
+
+    # GET 版本号与 GET latest 均返回同一快照
+    assert client.get("/api/publications/1").json() == data
+    assert client.get("/api/publications/latest").json() == data
+
+
+def test_versions_increment_and_published_versions_are_immutable(client):
+    # v1：R100 只有第 1 站，未发布时的实时成绩未完赛
+    post(client, "P-1", "R100", 1, "2026-09-25T08:00:00")
+    v1 = publish(client).json()
+    assert v1["version"] == 1
+    r100_v1 = next(r for r in v1["runners"] if r["runner_id"] == "R100")
+    assert r100_v1["complete"] is False
+
+    # 后续打卡让实时成绩变为完赛，并发布 v2
+    post(client, "P-2", "R100", 2, "2026-09-25T08:30:00")
+    post(client, "P-3", "R100", 3, "2026-09-25T09:00:00")
+    post(client, "P-4", "R100", 4, "2026-09-25T09:30:00")
+    post(client, "P-5", "R100", 5, "2026-09-25T10:00:00")
+    post(client, "P-6", "R100", 6, "2026-09-25T11:00:00")
+    v2 = publish(client).json()
+    assert v2["version"] == 2
+    r100_v2 = next(r for r in v2["runners"] if r["runner_id"] == "R100")
+    assert r100_v2["complete"] is True
+    assert r100_v2["total_seconds"] == 3 * 3600
+
+    # v1 不受后续打卡影响：R100 仍为未完赛
+    r100 = next(r for r in client.get("/api/publications/1").json()["runners"]
+                if r["runner_id"] == "R100")
+    assert r100 == r100_v1
+
+    # 更正与撤销也只影响实时成绩，不改已发布版本
+    post(client, "P-2X", "R100", 2, "2026-09-25T12:00:00", corrects="P-2")
+    client.post("/api/checkins/P-6/revoke")
+    assert client.get("/api/runners/R100/splits").json()["complete"] is False
+    frozen = client.get("/api/publications/2").json()
+    assert frozen == v2
+    assert client.get("/api/publications/latest").json() == v2
+
+    # 再次发布产生 v3，快照反映更正 / 撤销后的实时成绩
+    v3 = publish(client).json()
+    assert v3["version"] == 3
+    r100_v3 = next(r for r in v3["runners"] if r["runner_id"] == "R100")
+    assert r100_v3["complete"] is False
+    assert client.get("/api/publications/latest").json() == v3
+
+
+def test_published_snapshot_matches_live_splits_at_publish_time(client):
+    publish(client)  # v1
+    post(client, "L-1", "R200", 1, "2026-09-25T08:00:00")
+    post(client, "L-3", "R200", 3, "2026-09-25T09:00:00")
+    v2 = publish(client).json()
+    snapshot = next(r for r in v2["runners"] if r["runner_id"] == "R200")
+    live = client.get("/api/runners/R200/splits").json()
+    assert snapshot["complete"] == live["complete"]
+    assert snapshot["segments"] == live["segments"]
+    assert snapshot["stations"] == live["stations"]
+
+
+def test_runner_with_only_revoked_checkins_is_included(client, tmp_path, monkeypatch):
+    # 只有已撤销打卡的选手也属于"有记录的选手"，发布时仍保留一版 pending 结果
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "empty.db"))
+    monkeypatch.setattr(seed, "seed_if_empty", lambda conn: None)
+    with TestClient(app) as empty_client:
+        post(empty_client, "O-1", "R300", 1, "2026-09-25T08:00:00")
+        empty_client.post("/api/checkins/O-1/revoke")
+        data = publish(empty_client).json()
+        assert data["runner_count"] == 1
+        only = data["runners"][0]
+        assert only["runner_id"] == "R300"
+        assert only["complete"] is False
+        assert all(s["status"] == "pending" for s in only["segments"])
+
+
+def test_concurrent_checkin_cannot_mix_into_publishing_version(client, monkeypatch):
+    """并发打卡在发布事务取锁后排队：不得让同一版本混入不同时间点的数据。
+
+    通过给 db.get_conn 加装测试用连接包装器：当发布线程的 BEGIN IMMEDIATE
+    已获得写锁时发信号；主线程随后在另一个连接 / 线程中发起并发写入。
+    该写入必须被阻塞至发布提交后才完成，因此：
+    - v1 不含并发打卡的新选手（v1 数据来自发布前的同一提交点）；
+    - v2 才包含该选手。
+    """
+    real_get_conn = db_module.get_conn
+    lock_acquired = threading.Event()
+    publish_may_commit = threading.Event()
+
+    class SpyConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, params=()):
+            if sql == "BEGIN IMMEDIATE":
+                result = self._real.execute(sql)
+                lock_acquired.set()
+                # 留出窗口让主线程发起并发写并确认其被阻塞
+                assert publish_may_commit.wait(timeout=5)
+                return result
+            return self._real.execute(sql, params) if params else self._real.execute(sql)
+
+        def executemany(self, sql, seq):
+            return self._real.executemany(sql, seq)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def spy_get_conn():
+        return SpyConn(real_get_conn())
+
+    monkeypatch.setattr(db_module, "get_conn", spy_get_conn)
+
+    holder = {}
+
+    def do_publish():
+        conn = db_module.get_conn()
+        try:
+            holder["v1"] = service.publish_results(conn)
+        finally:
+            conn.close()
+
+    t = threading.Thread(target=do_publish)
+    t.start()
+    assert lock_acquired.wait(timeout=5)  # 发布事务已持锁
+
+    # 在另一连接中插入并发打卡：应被写锁阻塞，不能进入 v1
+    def concurrent_write():
+        writer = real_get_conn()  # 连接必须在使用它的线程内创建
+        writer.isolation_level = None
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "INSERT INTO checkins"
+                " (event_no, runner_id, station_seq, occurred_at, status, created_at)"
+                " VALUES ('C-1', 'RCONC', 1, '2026-09-25T08:00:00', 'active',"
+                " '2026-09-25T08:00:00+00:00')"
+            )
+            writer.execute("COMMIT")
+        finally:
+            writer.close()
+
+    wt = threading.Thread(target=concurrent_write)
+    wt.start()
+    # 写者进入排队：0.3s 内发布尚未提交，写者无法完成（连接 busy_timeout=5s）
+    assert not wt.join(timeout=0.3)
+    publish_may_commit.set()
+    t.join(timeout=5)
+    wt.join(timeout=5)
+
+    assert not t.is_alive() and not wt.is_alive()
+    v1 = client.get("/api/publications/1").json()
+    assert "RCONC" not in {r["runner_id"] for r in v1["runners"]}
+    assert v1["runner_count"] == 6  # 与发布前一致，未混入新数据
+
+    # 写者提交后发布 v2，新选手出现在 v2
+    v2 = publish(client).json()
+    assert v2["version"] == 2
+    assert "RCONC" in {r["runner_id"] for r in v2["runners"]}
+
+
+def test_concurrent_publications_serialize_into_distinct_versions(client):
+    errors = []
+
+    def do_publish():
+        try:
+            conn = db_module.get_conn()
+            try:
+                service.publish_results(conn)
+            finally:
+                conn.close()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=do_publish) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    versions = {
+        client.get(f"/api/publications/{i}").status_code for i in (1, 2, 3)
+    }
+    assert versions == {200}
+    assert client.get("/api/publications/4").status_code == 404
+    # 三个并发发布内容一致（同一提交点序列下的快照）
+    assert (
+        client.get("/api/publications/1").json()["runners"]
+        == client.get("/api/publications/3").json()["runners"]
+    )

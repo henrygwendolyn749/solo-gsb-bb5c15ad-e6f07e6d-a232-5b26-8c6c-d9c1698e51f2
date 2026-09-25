@@ -9,7 +9,10 @@
 - 同一站点多条有效打卡取**最早时间**；
 - 按站点顺序重算相邻站分段用时，**乱序补传**可填补缺段，更正 / 撤销即时更新结果；
 - 相邻站缺打卡或**时间倒退**时，该分段标记为 `pending`（待定）并说明原因；
-- 提供选手分段结果查询。
+- 提供选手分段结果查询；
+- 支持**成绩发布**：在同一事务中读取当前全部打卡，整版快照原子保存为递增版本
+  （并发打卡 / 更正 / 撤销在发布事务期间排队，同一版本不会混入不同时间点的数据）；
+  已发布版本永久冻结，后续打卡、更正或撤销只影响实时成绩。
 
 ## 启动
 
@@ -44,6 +47,9 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `GET` | `/api/checkins?runner_id=` | 打卡列表（含已更正 / 已撤销记录） |
 | `GET` | `/api/checkins/{event_no}` | 按事件号查询单条打卡 |
 | `GET` | `/api/runners/{runner_id}/splits` | 选手分段结果 |
+| `POST` | `/api/publications` | 发布当前实时成绩为新版本（整版快照，版本号递增） |
+| `GET` | `/api/publications/latest` | 查询最新发布版本；尚未发布时返回 `404` |
+| `GET` | `/api/publications/{version}` | 查询指定版本的完整成绩；版本不存在返回 `404` |
 
 ### 示例
 
@@ -173,6 +179,79 @@ curl http://localhost:8000/api/runners/R001/splits
 }
 ```
 
+## 成绩发布
+
+发布动作把**当前实时成绩整版固化**为一个不可变版本，版本号从 1 开始递增。发布在同一个 SQLite
+事务中读取当前全部打卡，并按现有分段规则（同站取最早、相邻站计算、缺站 / 时间倒退为 `pending`）
+为**所有有打卡记录的选手**（含仅有已撤销记录的选手）生成结果——未完赛选手同样保留其 `pending`
+分段。事务以 `BEGIN IMMEDIATE` 立即取得库级写锁，期间的打卡 / 更正 / 撤销只能排队，因此**同一
+版本不会混入不同时间点的数据**；版本头与全部选手快照在该事务内原子落盘。
+
+发布当前成绩（`201 Created`，返回该版本完整成绩）：
+
+```bash
+curl -X POST http://localhost:8000/api/publications
+```
+
+```json
+{
+  "version": 1,
+  "created_at": "2026-09-25T03:30:00.123456+00:00",
+  "runner_count": 6,
+  "complete_count": 3,
+  "station_count": 6,
+  "runners": [
+    {
+      "runner_id": "R001",
+      "complete": true,
+      "total_seconds": 12600,
+      "total": "3:30:00",
+      "stations": [
+        {"station_seq": 1, "event_no": "S-R001-1", "occurred_at": "2026-09-25T08:00:00+00:00"}
+      ],
+      "segments": [
+        {"from_station": 1, "to_station": 2, "status": "ok", "duration_seconds": 1920, "duration": "0:32:00", "reason": null}
+      ]
+    },
+    {
+      "runner_id": "R003",
+      "complete": false,
+      "total_seconds": null,
+      "total": null,
+      "stations": [
+        {"station_seq": 1, "event_no": "S-R003-1", "occurred_at": "2026-09-25T08:10:00+00:00"}
+      ],
+      "segments": [
+        {"from_station": 3, "to_station": 4, "status": "pending", "duration_seconds": null, "duration": null, "reason": "站点 4 缺少有效打卡"}
+      ]
+    }
+  ]
+}
+```
+
+查询指定版本与最新版本：
+
+```bash
+curl http://localhost:8000/api/publications/1
+curl http://localhost:8000/api/publications/latest
+```
+
+- 尚未发布任何版本时，`GET /api/publications/latest` 返回 `404`；
+- 查询不存在的版本号（如 `/api/publications/99`）返回 `404`。
+
+再次调用 `POST /api/publications` 生成下一版（版本号递增）。**后续打卡、更正或撤销只影响实时
+成绩，不改已发布版本**：例如发布 v1 后补传 / 撤销了打卡，v1 的内容保持不变；再次发布得到的 v2
+才反映这些变化。
+
+```bash
+# 发布后撤销 R001 第 3 站：实时成绩变为未完赛，但 v1 中 R001 仍为完赛
+curl -X POST http://localhost:8000/api/checkins/S-R001-3/revoke
+curl http://localhost:8000/api/publications/1     # R001 仍 complete=true（冻结）
+curl http://localhost:8000/api/runners/R001/splits  # 实时结果已为 complete=false
+curl -X POST http://localhost:8000/api/publications  # 产生 v2，反映撤销后的状态
+curl http://localhost:8000/api/publications/latest   # 现在返回 v2
+```
+
 ## 本地开发
 
 ```bash
@@ -189,4 +268,9 @@ pytest                               # 运行测试
 - 更正与写入在同一事务中完成，事件号唯一性由数据库主键保证（重复返回 409）；
 - 批量登记在同一数据库事务内按顺序处理全部记录，任一失败即整体回滚（含已做的状态变更），
   成功时基于全部新数据按现有分段规则重算受影响选手的最终完成状态与总用时；
-- 更正预演复用正式更正的校验与写入逻辑，在 `SAVEPOINT` 内试算后 `ROLLBACK TO` 整体回滚，对数据库零副作用。
+- 更正预演复用正式更正的校验与写入逻辑，在 `SAVEPOINT` 内试算后 `ROLLBACK TO` 整体回滚，对数据库零副作用；
+- 成绩发布以单条 `BEGIN IMMEDIATE` 事务读取当前全部打卡并按现有规则重算所有有记录选手
+  （未完赛选手保留 `pending` 分段），版本头（自增版本号）与每位选手的 JSON 快照在同一事务内
+  原子写入 `publications` / `publication_runners` 两表；写锁使并发打卡 / 更正 / 撤销排队，
+  保证同一版本数据来自同一提交点；已发布快照不可变，后续写入只改变实时重算结果；
+- 所有数据库连接设置 `busy_timeout=5000`：并发写相互排队而不是立即返回 `SQLITE_BUSY`。

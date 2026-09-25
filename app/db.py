@@ -17,6 +17,22 @@ CREATE TABLE IF NOT EXISTS checkins (
 );
 CREATE INDEX IF NOT EXISTS idx_checkins_runner_station
     ON checkins (runner_id, station_seq);
+
+-- 已发布的成绩版本：发布时整版快照，此后不再随实时打卡变化
+CREATE TABLE IF NOT EXISTS publications (
+    version        INTEGER PRIMARY KEY AUTOINCREMENT,  -- 递增版本号，从 1 开始
+    created_at     TEXT NOT NULL,                      -- 发布时间（ISO 8601，UTC）
+    runner_count   INTEGER NOT NULL,                   -- 本版选手数（含未完赛）
+    complete_count INTEGER NOT NULL                    -- 本版完赛选手数
+);
+-- 每个版本内每位选手的完整分段结果（含 pending 分段），以 JSON 原样固化
+CREATE TABLE IF NOT EXISTS publication_runners (
+    version     INTEGER NOT NULL REFERENCES publications(version),
+    runner_id   TEXT NOT NULL,
+    complete    INTEGER NOT NULL,                      -- 1=完赛，0=未完赛
+    splits_json TEXT NOT NULL,                         -- SplitsOut 的 JSON 快照
+    PRIMARY KEY (version, runner_id)
+);
 """
 
 
@@ -28,6 +44,8 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 并发写（打卡 / 发布）排队等待对方事务完成，而不是立即 SQLITE_BUSY
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
